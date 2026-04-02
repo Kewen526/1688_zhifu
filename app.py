@@ -20,6 +20,7 @@ from typing import List, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 # 并发查询支付渠道的最大线程数
@@ -37,6 +38,14 @@ app = FastAPI(
     title="1688订单支付API",
     description="提供1688订单支付链接获取和支付状态查询服务",
     version="1.0.0"
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
