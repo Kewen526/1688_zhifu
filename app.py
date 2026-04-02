@@ -42,11 +42,12 @@ app = FastAPI(
 
 # ==================== 请求/响应模型 ====================
 class PayUrlRequest(BaseModel):
-    order_ids: List[str] = Field(..., description="订单ID列表，最多30个", max_length=30)
+    order_ids: List[str] = Field(..., description="订单ID列表")
 
 
 class PayUrlResponse(BaseModel):
     success: bool
+    pay_urls: List[str] = []
     pay_url: Optional[str] = None
     success_order_ids: List[str] = []
     failed_order_ids: List[str] = []
@@ -238,12 +239,41 @@ def get_crossborder_pay_url(order_id_list: List[str]) -> dict:
 
 
 # ==================== API 端点 ====================
+def _process_pay_url_batch(batch_orders: List[str]) -> dict:
+    """
+    处理单批次(最多30个)订单的支付链接获取
+    返回: {'pay_url': str|None, 'success_ids': [], 'failed_ids': [], 'error_msg': str|None}
+    """
+    result = get_crossborder_pay_url(batch_orders)
+
+    is_success, pay_url = is_api_success(result)
+    if is_success:
+        return {'pay_url': pay_url, 'success_ids': list(batch_orders), 'failed_ids': [], 'error_msg': None}
+
+    # 有错误，尝试从错误消息中提取失败的订单
+    api_error_msg = result.get('errorMsg', '')
+    if api_error_msg:
+        api_failed_ids = extract_failed_order_ids(api_error_msg)
+        if api_failed_ids:
+            api_success_ids = [oid for oid in batch_orders if oid not in api_failed_ids]
+            if api_success_ids:
+                retry_result = get_crossborder_pay_url(api_success_ids)
+                retry_success, retry_pay_url = is_api_success(retry_result)
+                if retry_success:
+                    return {'pay_url': retry_pay_url, 'success_ids': api_success_ids, 'failed_ids': api_failed_ids, 'error_msg': api_error_msg}
+            return {'pay_url': None, 'success_ids': [], 'failed_ids': list(batch_orders), 'error_msg': api_error_msg}
+        return {'pay_url': None, 'success_ids': [], 'failed_ids': list(batch_orders), 'error_msg': api_error_msg}
+
+    other_error = result.get('error', '未知错误')
+    return {'pay_url': None, 'success_ids': [], 'failed_ids': list(batch_orders), 'error_msg': other_error}
+
+
 @app.post("/api/pay-url", response_model=PayUrlResponse, summary="获取支付链接")
 async def api_get_pay_url(request: PayUrlRequest):
     """
     获取1688跨境宝支付链接
 
-    - **order_ids**: 订单ID列表，最多支持30个订单
+    - **order_ids**: 订单ID列表，支持超过30个订单（自动分批处理）
 
     返回支付链接及订单处理结果
     """
@@ -252,18 +282,13 @@ async def api_get_pay_url(request: PayUrlRequest):
     if not order_ids:
         raise HTTPException(status_code=400, detail="订单ID列表不能为空")
 
-    if len(order_ids) > 30:
-        raise HTTPException(status_code=400, detail="订单数量不能超过30个")
-
-    # ===== 第一步: 检查每个订单是否支持跨境宝支付渠道 =====
+    # ===== 第一步: 并发检查每个订单是否支持跨境宝支付渠道 =====
     supported_orders, unsupported_orders = filter_crossborder_orders(order_ids)
 
-    # 收集所有错误信息
     error_messages = []
     if unsupported_orders:
         error_messages.append(f"订单不支持跨境宝支付渠道: [{', '.join(unsupported_orders)}]")
 
-    # 如果全部不支持跨境宝，直接返回失败
     if not supported_orders:
         return PayUrlResponse(
             success=False,
@@ -275,96 +300,43 @@ async def api_get_pay_url(request: PayUrlRequest):
             success_order_ids=[]
         )
 
-    # ===== 第二步: 用支持跨境宝的订单调用支付链接API =====
-    result = get_crossborder_pay_url(supported_orders)
+    # ===== 第二步: 按每30个一批分组，获取支付链接 =====
+    BATCH_SIZE = 30
+    batches = [supported_orders[i:i + BATCH_SIZE] for i in range(0, len(supported_orders), BATCH_SIZE)]
 
-    # 情况1: 完全成功
-    is_success, pay_url = is_api_success(result)
-    if is_success:
+    all_pay_urls = []
+    all_success_ids = []
+    all_api_failed_ids = []
+
+    for batch in batches:
+        batch_result = _process_pay_url_batch(batch)
+        if batch_result['pay_url']:
+            all_pay_urls.append(batch_result['pay_url'])
+        all_success_ids.extend(batch_result['success_ids'])
+        all_api_failed_ids.extend(batch_result['failed_ids'])
+        if batch_result['error_msg']:
+            error_messages.append(batch_result['error_msg'])
+
+    all_failed_ids = unsupported_orders + all_api_failed_ids
+
+    if all_success_ids:
         return PayUrlResponse(
             success=True,
-            pay_url=pay_url,
-            success_order_ids=supported_orders,
-            success_count=len(supported_orders),
+            pay_urls=all_pay_urls,
+            pay_url=all_pay_urls[0] if len(all_pay_urls) == 1 else None,
+            success_order_ids=all_success_ids,
+            success_count=len(all_success_ids),
+            failed_order_ids=all_failed_ids,
+            failed_count=len(all_failed_ids),
             total_count=len(order_ids),
-            failed_count=len(unsupported_orders),
-            failed_order_ids=unsupported_orders,
             error_msg='; '.join(error_messages) if error_messages else None
         )
 
-    # 情况2: 有错误，尝试从错误消息中提取失败的订单
-    api_error_msg = result.get('errorMsg', '')
-    if api_error_msg:
-        api_failed_ids = extract_failed_order_ids(api_error_msg)
-
-        if api_failed_ids:
-            # 从支持跨境宝的订单中去掉API返回失败的
-            api_success_ids = [oid for oid in supported_orders if oid not in api_failed_ids]
-            # 合并所有失败订单
-            all_failed_ids = unsupported_orders + api_failed_ids
-            # 合并错误信息
-            error_messages.append(api_error_msg)
-
-            if api_success_ids:
-                # 使用成功的订单重新获取支付链接
-                retry_result = get_crossborder_pay_url(api_success_ids)
-                retry_success, retry_pay_url = is_api_success(retry_result)
-
-                if retry_success:
-                    return PayUrlResponse(
-                        success=True,
-                        pay_url=retry_pay_url,
-                        success_order_ids=api_success_ids,
-                        failed_order_ids=all_failed_ids,
-                        success_count=len(api_success_ids),
-                        failed_count=len(all_failed_ids),
-                        total_count=len(order_ids),
-                        error_msg='; '.join(error_messages)
-                    )
-                else:
-                    error_messages_retry = list(error_messages)
-                    retry_error = retry_result.get('errorMsg', '未知错误')
-                    if retry_error not in error_messages_retry:
-                        error_messages_retry.append(retry_error)
-                    return PayUrlResponse(
-                        success=False,
-                        error_msg='; '.join(error_messages_retry),
-                        failed_order_ids=unsupported_orders + supported_orders,
-                        failed_count=len(order_ids),
-                        total_count=len(order_ids),
-                        success_count=0,
-                        success_order_ids=[]
-                    )
-            else:
-                return PayUrlResponse(
-                    success=False,
-                    error_msg='; '.join(error_messages),
-                    failed_order_ids=all_failed_ids,
-                    failed_count=len(all_failed_ids),
-                    total_count=len(order_ids),
-                    success_count=0,
-                    success_order_ids=[]
-                )
-        else:
-            error_messages.append(api_error_msg)
-            return PayUrlResponse(
-                success=False,
-                error_msg='; '.join(error_messages),
-                failed_order_ids=unsupported_orders + supported_orders,
-                failed_count=len(order_ids),
-                total_count=len(order_ids),
-                success_count=0,
-                success_order_ids=[]
-            )
-
-    # 其他情况
-    other_error = result.get('error', '未知错误')
-    error_messages.append(other_error)
     return PayUrlResponse(
         success=False,
-        error_msg='; '.join(error_messages),
-        failed_order_ids=unsupported_orders + supported_orders,
-        failed_count=len(order_ids),
+        error_msg='; '.join(error_messages) if error_messages else '未知错误',
+        failed_order_ids=all_failed_ids,
+        failed_count=len(all_failed_ids),
         total_count=len(order_ids),
         success_count=0,
         success_order_ids=[]
