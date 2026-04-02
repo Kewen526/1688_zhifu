@@ -17,9 +17,13 @@ import hmac
 import hashlib
 import re
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
+
+# 并发查询支付渠道的最大线程数
+MAX_PAY_WAY_WORKERS = 10
 
 # ==================== API配置 ====================
 API_CONFIG = {
@@ -152,28 +156,40 @@ def query_pay_way(order_id: str) -> dict:
         return {'error': str(e), 'success': False}
 
 
+def _check_single_order_pay_way(order_id: str) -> tuple:
+    """检查单个订单是否支持跨境宝支付渠道，返回 (order_id, is_supported)"""
+    result = query_pay_way(order_id)
+    success_value = result.get('success')
+
+    if success_value == True or success_value == 'true':
+        channels = result.get('resultList', {}).get('channels', [])
+        has_crossborder = any(ch.get('code') == 20 for ch in channels)
+        return order_id, has_crossborder
+
+    return order_id, False
+
+
 def filter_crossborder_orders(order_ids: List[str]) -> tuple:
     """
-    检查每个订单是否支持跨境宝(code=20)支付渠道
+    并发检查每个订单是否支持跨境宝(code=20)支付渠道
+    使用线程池并发查询，最多同时 MAX_PAY_WAY_WORKERS 个请求
     返回: (supported_orders, unsupported_orders)
     """
     supported = []
     unsupported = []
 
-    for order_id in order_ids:
-        result = query_pay_way(order_id)
-        success_value = result.get('success')
+    with ThreadPoolExecutor(max_workers=MAX_PAY_WAY_WORKERS) as executor:
+        futures = {
+            executor.submit(_check_single_order_pay_way, order_id): order_id
+            for order_id in order_ids
+        }
 
-        if success_value == True or success_value == 'true':
-            channels = result.get('resultList', {}).get('channels', [])
-            has_crossborder = any(ch.get('code') == 20 for ch in channels)
-            if has_crossborder:
+        for future in as_completed(futures):
+            order_id, is_supported = future.result()
+            if is_supported:
                 supported.append(order_id)
             else:
                 unsupported.append(order_id)
-        else:
-            # 查询失败的订单也归入不支持
-            unsupported.append(order_id)
 
     return supported, unsupported
 
